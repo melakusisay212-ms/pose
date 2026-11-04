@@ -1,0 +1,104 @@
+name: Build APK
+
+# Upload a project zip to the repo root (or to incoming/) and this workflow
+# unpacks it into the repo, deletes the zip, and builds the APK.
+# Pushing normal files (no zip) just builds.
+# The zip never replaces files under .github/, so this file is changed by hand.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack uploaded zip (if any)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=( ./*.zip incoming/*.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No zip to unpack."
+            exit 0
+          fi
+          for z in "${zips[@]}"; do
+            echo "Unpacking $z"
+            dest="$(mktemp -d)"
+            unzip -q -o "$z" -d "$dest"
+            rm -rf "$dest/__MACOSX"
+            root="$dest"
+            mapfile -t entries < <(find "$dest" -mindepth 1 -maxdepth 1)
+            # Strip one wrapper folder only when it holds the project itself
+            # (has pubspec.yaml); a lone lib/ or test/ folder is real content.
+            if [ ${#entries[@]} -eq 1 ] && [ -f "${entries[0]}/pubspec.yaml" ]; then
+              root="${entries[0]}"
+            fi
+            (cd "$root" && tar --exclude='./.git' --exclude='./.github' -cf - .) | tar -xf -
+            rm -f "$z"
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Unpack uploaded zip" || echo "Nothing to commit."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+  build:
+    needs: unpack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create the Android project if missing
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.melaku \
+              --project-name pose_runner "$RUNNER_TEMP/scaffold"
+            cp -r "$RUNNER_TEMP/scaffold/android" android
+          fi
+          chmod +x android/gradlew || true
+
+      - name: Patch Android (camera permission, minSdk)
+        run: python3 tools/patch_android.py .
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Test
+        run: flutter test
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pose-runner-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 14
