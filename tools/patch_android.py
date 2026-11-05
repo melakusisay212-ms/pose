@@ -58,6 +58,40 @@ def patch_gradle(path: Path) -> None:
     print(f"gradle: minSdk {'set to ' + str(MIN_SDK) if changed else 'already ok'} ({path})")
 
 
+RELEASE_BLOCK = re.compile(r"(\brelease\s*\{)")
+
+
+def patch_release_minify(path: Path) -> None:
+    """Turn off R8 code shrinking/obfuscation for the release build.
+
+    Crash logs showed the release APK dying at launch because R8 broke
+    ML Kit's component registrars and WorkManager's Room database
+    (androidx.work.impl.WorkDatabase). Disabling minify avoids that.
+    """
+    text = path.read_text(encoding="utf-8")
+    if "PoseRunner: minify off" in text:
+        print(f"gradle: release minify already off ({path})")
+        return
+    is_kts = path.suffix == ".kts"
+    if is_kts:
+        lines = ("isMinifyEnabled = false", "isShrinkResources = false")
+    else:
+        lines = ("minifyEnabled false", "shrinkResources false")
+    match = None
+    for m in RELEASE_BLOCK.finditer(text):
+        if "buildTypes" in text[: m.start()]:
+            match = m
+            break
+    if match is None:
+        raise SystemExit(f"gradle: no release buildType found in {path}")
+    block = "\n            // PoseRunner: minify off\n" + "".join(
+        f"            {line}\n" for line in lines
+    )
+    patched = text[: match.end()] + block + text[match.end():]
+    path.write_text(patched, encoding="utf-8")
+    print(f"gradle: release minify disabled ({path})")
+
+
 def main() -> None:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
     manifest = root / "android/app/src/main/AndroidManifest.xml"
@@ -73,6 +107,7 @@ def main() -> None:
     patch_manifest(manifest)
     for gradle in gradle_files:
         patch_gradle(gradle)
+        patch_release_minify(gradle)
 
 
 if __name__ == "__main__":
