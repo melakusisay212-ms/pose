@@ -93,12 +93,69 @@ jobs:
       - name: Test
         run: flutter test
 
+      - name: Build release APK without R8 shrinking
+        run: |
+          flutter build apk --release --no-shrink
+          cp build/app/outputs/flutter-apk/app-release.apk build/app/outputs/flutter-apk/app-release-noshrink.apk
+
       - name: Build release APK
         run: flutter build apk --release
 
-      - name: Upload APK
+      - name: Build debug APK
+        run: flutter build apk --debug
+
+      - name: Write the emulator smoke-test script
+        run: |
+          cat > "$RUNNER_TEMP/smoke.sh" <<'SCRIPT'
+          set +e
+          PKG=com.melaku.pose_runner
+          mkdir -p crashlogs
+          for f in release debug release-noshrink; do
+            apk=build/app/outputs/flutter-apk/app-$f.apk
+            [ -f "$apk" ] || continue
+            adb uninstall $PKG >/dev/null 2>&1
+            adb install -r "$apk"
+            adb logcat -c
+            adb shell monkey -p $PKG -c android.intent.category.LAUNCHER 1
+            sleep 20
+            adb logcat -d > crashlogs/$f.txt
+            echo "=== $f : process alive? ==="
+            adb shell pidof $PKG || echo "NOT RUNNING (crashed or closed)"
+            echo "=== $f : crash lines ==="
+            grep -E -A25 "FATAL EXCEPTION|Fatal signal|AndroidRuntime" crashlogs/$f.txt | head -80
+          done
+          SCRIPT
+
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Launch each APK on an emulator and capture the crash log
+        continue-on-error: true
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          arch: x86_64
+          target: google_apis
+          script: bash ${{ runner.temp }}/smoke.sh
+
+      - name: Upload crash logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashlogs
+          path: crashlogs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
           name: pose-runner-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/app-release-noshrink.apk
+            build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
